@@ -10,8 +10,9 @@ set -euo pipefail
 # afterwards (CodeLeague → Settings → License, or the first-run screen).
 #
 # Usage:
-#   ./install-codeleague.sh                 # interactive menu (install / status / uninstall)
+#   ./install-codeleague.sh                 # interactive menu (install / register / status / uninstall)
 #   ./install-codeleague.sh --install       # non-interactive install/update (HTTP on :3000)
+#   ./install-codeleague.sh --register      # register for a license (email + country)
 #   ./install-codeleague.sh --status        # show status
 #   ./install-codeleague.sh --uninstall     # stop & remove (keeps data unless you confirm)
 #
@@ -28,8 +29,37 @@ HOST_PORT="${CODELEAGUE_PORT:-3000}"
 DIR="${CODELEAGUE_DIR:-$(pwd)/codeleague}"
 COMPOSE="$DIR/docker-compose.yml"
 
+# --- License registration (optional in-installer sign-up) -------------------
+# Users without a license can register from the installer: they get a license
+# emailed to them, then activate it in-app. Country list and registration go
+# through the public Speedbits License Manager API.
+#
+# This signs up for Code League COMMUNITY (free) and nothing else. Registration
+# is deliberately disabled server-side for codeleague-desktop and
+# codeleague-server: this script is public, so the key below must be treated as
+# public too, and a PAID product that accepted it would let anyone mint a paid
+# license by confirming an email. Desktop/Server licenses come from FastSpring,
+# a voucher, or Smart In Venture directly.
+#
+# The key is a product key, not a secret — it only authorises registration for
+# the free product, and the key must match the product (a COCO_ key authorises
+# Community alone). It is a dedicated key labelled "installer-selfservice" so
+# the release pipeline can never overwrite it: prepare-version replaces the key
+# row for a given version string, which would silently break every installer
+# already in the wild. Override with CODELEAGUE_API_KEY if it is ever rotated;
+# rotate by adding a new key and deactivating the old one, so both work during
+# the overlap.
+LICENSE_API_BASE="${LICENSE_API_BASE:-https://license.speedbits.io}"
+PRODUCT_SHORT_CODE="codeleague-community"
+REGISTER_WEB_URL="https://www.speedbits.io"
+LICENSE_API_KEY="${CODELEAGUE_API_KEY:-COCO_18mqkJSpVnasbE4rduNf}"
+# The published registration form is served by the License Manager, not the
+# marketing site, so build the fallback link from LICENSE_API_BASE.
+REGISTER_PAGE_URL="$LICENSE_API_BASE/register/$PRODUCT_SHORT_CODE"
+
 msg()  { printf '%s\n' "$*"; }
 err()  { printf 'ERROR: %s\n' "$*" >&2; }
+have() { command -v "$1" >/dev/null 2>&1; }
 
 server_ip() {
     local ip
@@ -99,6 +129,141 @@ resolve_machine_id() {
     mkdir -p "$DIR/data"
     printf '%s\n' "$MACHINE_ID" > "$f"
     chmod 600 "$f" 2>/dev/null || true
+}
+
+# ----------------------------------------------------------------------------
+# Register for a license from inside the installer.
+#
+# Flow: collect email + country (+ optional name), get consent, then
+# POST /api/register with the baked-in installer api_key. The License Manager
+# emails a verification link; after verifying, the customer receives their
+# license key by email and activates it in-app (Settings → License).
+# ----------------------------------------------------------------------------
+
+# Extract a top-level field from a JSON object (jq preferred, sed fallback).
+json_get() {  # <json> <key>
+    if have jq; then printf '%s' "$1" | jq -r --arg k "$2" '.[$k] // empty' 2>/dev/null
+    else printf '%s' "$1" | sed -nE "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"?([^\",}]*)\"?.*/\1/p" | head -1; fi
+}
+
+# Let the user pick a country. With curl+jq we fetch GET /api/countries and let
+# them search by name or 2-letter code; otherwise we just ask for a value (the
+# register API accepts either a country name or its 2-letter code).
+# All UI is written to stderr; only the chosen value goes to stdout.
+pick_country() {
+    if have curl && have jq; then
+        local list
+        list="$(curl -sS --max-time 15 "$LICENSE_API_BASE/api/countries" 2>/dev/null || true)"
+        if [ -n "$list" ] && [ "$(printf '%s' "$list" | jq -r '.success // false' 2>/dev/null)" = "true" ]; then
+            while true; do
+                local term; term="$(prompt '  Country (type part of the name, or a 2-letter code)' '')"
+                [ -z "$term" ] && { printf ''; return; }
+                local up; up="$(printf '%s' "$term" | tr '[:lower:]' '[:upper:]')"
+                local by_code
+                by_code="$(printf '%s' "$list" | jq -r --arg c "$up" '.countries[]|select(.code==$c)|.code' 2>/dev/null | head -1)"
+                if [ -n "$by_code" ]; then printf '%s' "$by_code"; return; fi
+                local low matches
+                low="$(printf '%s' "$term" | tr '[:upper:]' '[:lower:]')"
+                matches="$(printf '%s' "$list" | jq -r --arg t "$low" '.countries[]|select((.name|ascii_downcase)|contains($t))|.code+"  "+.name' 2>/dev/null)"
+                if [ -z "$matches" ]; then msg "    No match for \"$term\" — try again." >&2; continue; fi
+                msg "    Matches:" >&2
+                printf '%s\n' "$matches" | nl -w4 -s') ' >&2
+                local sel; sel="$(prompt '  Pick a number (Enter to search again)' '')"
+                [ -z "$sel" ] && continue
+                local chosen
+                chosen="$(printf '%s\n' "$matches" | sed -n "${sel}p" 2>/dev/null | awk '{print $1}')"
+                if [ -n "$chosen" ]; then printf '%s' "$chosen"; return; fi
+                msg "    Invalid choice." >&2
+            done
+        fi
+    fi
+    prompt '  Country (name or 2-letter code)' ''
+}
+
+register_for_license() {
+    have curl || { err "curl is required to register from the installer (apt install curl)."; return 1; }
+
+    msg ""
+    msg "Register for a CodeLeague license (Speedbits):"
+    local email name country
+    email="$(prompt '  Your email' '')"
+    if [ -z "$email" ] || [[ "$email" != *"@"*"."* ]]; then
+        err "A valid email address is required."; return 1
+    fi
+    name="$(prompt '  Your name (optional)' '')"
+    country="$(pick_country)"
+    if [ -z "$country" ]; then err "A country is required."; return 1; fi
+
+    # API registration has no web page to carry the checkboxes, so the privacy,
+    # terms and license acceptances must be sent — and the user must actually
+    # agree. Only proceed on an explicit yes.
+    msg ""
+    msg "  By registering you accept the Privacy Policy, Terms of Service and"
+    msg "  License Agreement (see $REGISTER_WEB_URL)."
+    local ok; ok="$(prompt '  Do you accept and want to register? (y/N)' 'N')"
+    case "$ok" in [Yy]*) ;; *) msg "  Registration cancelled."; return 1 ;; esac
+
+    local payload
+    if have jq; then
+        payload="$(jq -nc \
+            --arg em "$email" --arg nm "$name" --arg co "$country" \
+            --arg sc "$PRODUCT_SHORT_CODE" --arg ak "$LICENSE_API_KEY" \
+            '{email:$em, name:$nm, country:$co, short_code:$sc, api_key:$ak,
+              accepted_privacy:true, accepted_terms:true, accepted_license:true}')"
+    else
+        payload="$(printf '{"email":"%s","name":"%s","country":"%s","short_code":"%s","api_key":"%s","accepted_privacy":true,"accepted_terms":true,"accepted_license":true}' \
+            "$email" "$name" "$country" "$PRODUCT_SHORT_CODE" "$LICENSE_API_KEY")"
+    fi
+
+    msg "  Registering with $LICENSE_API_BASE ..."
+    local resp code body success message errcode retry
+    resp="$(curl -sS --max-time 20 -w $'\n%{http_code}' \
+        -X POST "$LICENSE_API_BASE/api/register" \
+        -H 'Content-Type: application/json' -d "$payload" 2>/dev/null || true)"
+    code="$(printf '%s' "$resp" | tail -n1)"
+    body="$(printf '%s' "$resp" | sed '$d')"
+    success="$(json_get "$body" success)"
+    message="$(json_get "$body" message)"
+    errcode="$(json_get "$body" error_code)"; [ -z "$errcode" ] && errcode="$(json_get "$body" error)"
+
+    if [ "$code" = "200" ] && [ "$success" = "true" ]; then
+        msg ""
+        # resent:true — this address already holds an active Community license, so
+        # the SAME key was emailed again. There is no verification link to click;
+        # saying otherwise leaves the user waiting for mail that never arrives.
+        if [ "$(json_get "$body" resent)" = "true" ]; then
+            msg "✅ $email already has a Code League Community license."
+            msg "   We've emailed that key to you again — check your mail."
+            msg "   Activate it in CodeLeague → Settings → License (then restart the container)."
+        else
+            msg "✅ Registration submitted for $email."
+            msg "   1) Check your inbox and click the verification link."
+            msg "   2) Your license key is then emailed to you."
+            msg "   3) Activate it in CodeLeague → Settings → License (then restart the container)."
+        fi
+        return 0
+    fi
+
+    # Anything else: explain and fall back to the website registration form.
+    case "$code" in
+        401) err "The installer's API key was rejected${message:+ ($message)}." ;;
+        403) err "Self-service registration isn't available for this build${message:+ ($message)}." ;;
+        404) err "The License Manager doesn't know the product '$PRODUCT_SHORT_CODE'${message:+ ($message)}." ;;
+        429) # Five attempts per hour PER IP: one machine won't hit this, but an
+             # office or lab behind a single NAT will. Never retry automatically.
+             retry="$(json_get "$body" retry_after)"
+             if printf '%s' "$retry" | grep -qE '^[0-9]+$'; then
+                 err "Too many registration attempts — try again in about $(( (retry + 59) / 60 )) minute(s)."
+             else
+                 err "Too many registration attempts${message:+ ($message)}. Please try again later."
+             fi
+             msg "   The limit counts your whole network, so colleagues sharing your"
+             msg "   connection count too. Re-running now will not help." ;;
+        *)   if [ -n "$message" ]; then err "Registration failed: $message"
+             else err "Registration failed (HTTP ${code:-no response})."; fi ;;
+    esac
+    msg "   You can register on the website instead: $REGISTER_PAGE_URL"
+    return 1
 }
 
 # ----------------------------------------------------------------------------
@@ -298,8 +463,24 @@ interactive_install() {
     HOST_PORT="$(prompt '  HTTP port' "$HOST_PORT")"
     DIR="$(prompt '  Install directory' "$DIR")"
     COMPOSE="$DIR/docker-compose.yml"
-    # No license is collected — CodeLeague boots in Community mode and you
-    # activate premium in-app (Settings → License). See the post-install note.
+
+    # CodeLeague installs in Community mode regardless; a license only unlocks
+    # premium (activated in-app). Offer to register users who don't have one yet.
+    msg ""
+    local haslic
+    haslic="$(prompt 'Do you already have a CodeLeague license from speedbits.io? (y/N)' 'N')"
+    case "$haslic" in
+        [Yy]*)
+            msg "  Great — after install, activate it: CodeLeague → Settings → License." ;;
+        *)
+            local wantreg
+            wantreg="$(prompt 'Register now to get a license by email? (Y/n)' 'Y')"
+            case "$wantreg" in
+                [Nn]*) msg "  No problem — you can register later ($0 --register) or in-app." ;;
+                *)     register_for_license || true ;;   # never block the install
+            esac ;;
+    esac
+
     install
 }
 
@@ -310,17 +491,19 @@ main_menu() {
         msg "  CodeLeague — what would you like to do?"
         msg "============================================================"
         msg "  1) Install / update"
-        msg "  2) Show status"
-        msg "  3) Uninstall"
-        msg "  4) Quit"
+        msg "  2) Register for a license (speedbits.io)"
+        msg "  3) Show status"
+        msg "  4) Uninstall"
+        msg "  5) Quit"
         local choice
         choice="$(prompt '  Select' '1')"
         case "$choice" in
             1) interactive_install; break ;;
-            2) show_status ;;
-            3) uninstall; break ;;
-            4|q|Q) msg "Bye."; break ;;
-            *) msg "  Please choose 1-4." ;;
+            2) register_for_license || true ;;
+            3) show_status ;;
+            4) uninstall; break ;;
+            5|q|Q) msg "Bye."; break ;;
+            *) msg "  Please choose 1-5." ;;
         esac
     done
 }
@@ -329,7 +512,8 @@ case "${1:-}" in
     --status)     HOST_PORT="${CODELEAGUE_PORT:-$HOST_PORT}"; show_status ;;
     --uninstall)  uninstall ;;
     --install)    install ;;                          # non-interactive (env/defaults)
-    --help|-h)    sed -n '4,21p' "$0" | sed 's/^# \{0,1\}//' ;;
+    --register)   register_for_license ;;             # register for a license, then exit
+    --help|-h)    sed -n '4,22p' "$0" | sed 's/^# \{0,1\}//' ;;
     ""|--menu)    main_menu ;;                        # interactive menu + prompts
-    *)            err "Unknown option: $1"; msg "Use: $0 [--menu|--install|--status|--uninstall|--help]"; exit 1 ;;
+    *)            err "Unknown option: $1"; msg "Use: $0 [--menu|--install|--register|--status|--uninstall|--help]"; exit 1 ;;
 esac

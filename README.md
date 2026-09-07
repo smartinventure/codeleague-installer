@@ -52,6 +52,37 @@ shows the manual command instead:
 ./install-codeleague.sh --install       # pull the new image + recreate in place
 ```
 
+## Register for a license (no license yet?)
+
+During an interactive install (`./install-codeleague.sh`) the installer asks
+whether you already have a CodeLeague license. If not, it can sign you up for a
+free **Code League Community** license on the spot: you enter your **email** and
+pick your **country** (searched from the live country list), accept the terms,
+and it submits the request to `https://license.speedbits.io`. You then get a
+verification email, and once verified your **license key** is emailed to you —
+activate it in-app (below).
+
+Re-running `--register` with an address that already has a Community license
+simply re-sends that same key by email; there is no second verification step.
+
+Paid **Desktop** and **Server** licenses are not issued this way — those come
+from the shop, a voucher, or Smart In Venture directly.
+
+You can also run it directly at any time:
+
+```bash
+./install-codeleague.sh --register
+```
+
+Registration needs `curl` (and uses `jq` for the searchable country picker when
+present; without `jq` you just type the country name or 2-letter code). If
+self-service registration is unavailable, it points you to the web form at
+`https://license.speedbits.io/register/codeleague-community`.
+
+Sign-ups are rate-limited to five per hour **per IP address**, so everyone
+sharing your connection counts toward it. If you hit the limit the installer
+tells you roughly how long to wait — re-running immediately will not help.
+
 ## Activate your license (unlock premium)
 
 The container starts in **Community mode**. To unlock premium features (AI
