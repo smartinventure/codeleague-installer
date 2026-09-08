@@ -15,12 +15,17 @@ set -euo pipefail
 #   ./install-codeleague.sh --register      # register for a license (email + country)
 #   ./install-codeleague.sh --status        # show status
 #   ./install-codeleague.sh --uninstall     # stop & remove (keeps data unless you confirm)
+#   ./install-codeleague.sh --version       # print the installer version
 #
 # Optional environment variables (also used as the defaults in the menu):
 #   CODELEAGUE_PORT=8080          # host port (default 3000)
 #   CODELEAGUE_DIR=/opt/codeleague# install directory (default: ./codeleague)
 #   CODELEAGUE_IMAGE=...          # override image tag
 # ============================================================================
+
+# Installer-script version (the container image is versioned separately by its
+# tag). Bump when you change this script; shown by --version.
+INSTALLER_VERSION="1.0.0"
 
 IMAGE="${CODELEAGUE_IMAGE:-ghcr.io/speedbitsinfinitytools/codeleague:latest-release}"
 CONTAINER_NAME="${CODELEAGUE_CONTAINER:-codeleague}"
@@ -513,7 +518,8 @@ case "${1:-}" in
     --uninstall)  uninstall ;;
     --install)    install ;;                          # non-interactive (env/defaults)
     --register)   register_for_license ;;             # register for a license, then exit
-    --help|-h)    sed -n '4,22p' "$0" | sed 's/^# \{0,1\}//' ;;
+    --version|-V) msg "install-codeleague.sh $INSTALLER_VERSION" ;;
+    --help|-h)    awk 'NR>4 && /^# ={10,}/ { exit } NR>4' "$0" | sed 's/^# \{0,1\}//' ;;
     ""|--menu)    main_menu ;;                        # interactive menu + prompts
-    *)            err "Unknown option: $1"; msg "Use: $0 [--menu|--install|--register|--status|--uninstall|--help]"; exit 1 ;;
+    *)            err "Unknown option: $1"; msg "Use: $0 [--menu|--install|--register|--status|--uninstall|--version|--help]"; exit 1 ;;
 esac
