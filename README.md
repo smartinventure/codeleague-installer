@@ -5,6 +5,31 @@ Run the **CodeLeague server** with just Docker — no Infinity Tools required.
 and starts CodeLeague in **Community mode**. You activate your license **inside
 the app** afterwards.
 
+## Quick install
+
+The script on the `main` branch is always the current installer, so this is the
+URL to link to:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/smartinventure/codeleague-installer/main/install-codeleague.sh
+bash install-codeleague.sh
+```
+
+That opens the interactive menu (install / register for a license / status /
+uninstall). To skip the menu and install straight away:
+
+```bash
+bash install-codeleague.sh --install
+```
+
+Downloading before running, rather than piping into `bash`, is deliberate: the
+installer drives Docker on your machine, so it is worth being able to read it
+first.
+
+`main` is the newest installer, not a fixed release — to **pin a version**, swap
+`main` in the URL for a release tag or commit SHA. Re-running the installer
+updates in place.
+
 ## Requirements
 
 - Docker Engine + Docker Compose v2 (`docker compose`)
