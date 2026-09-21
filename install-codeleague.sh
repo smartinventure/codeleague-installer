@@ -21,11 +21,21 @@ set -euo pipefail
 #   CODELEAGUE_PORT=8080          # host port (default 3000)
 #   CODELEAGUE_DIR=/opt/codeleague# install directory (default: ./codeleague)
 #   CODELEAGUE_IMAGE=...          # override image tag
+#   CODELEAGUE_REPO_PATHS=/srv/git,/mnt/code
+#                                 # Existing git repositories ALREADY on this host that
+#                                 # Code League should analyse. Each is mounted at the
+#                                 # same path inside the container, read-write (sync
+#                                 # writes inside .git). Only these directories are
+#                                 # exposed -- never the whole filesystem. Repositories
+#                                 # imported from GitHub/GitLab/Azure do NOT need this:
+#                                 # they are cloned into <dir>/repos automatically.
+#                                 # On an update the previous mounts are reused, so this
+#                                 # only needs setting when you want to change them.
 # ============================================================================
 
 # Installer-script version (the container image is versioned separately by its
 # tag). Bump when you change this script; shown by --version.
-INSTALLER_VERSION="1.0.0"
+INSTALLER_VERSION="1.1.0"
 
 IMAGE="${CODELEAGUE_IMAGE:-ghcr.io/speedbitsinfinitytools/codeleague:latest-release}"
 CONTAINER_NAME="${CODELEAGUE_CONTAINER:-codeleague}"
@@ -98,6 +108,96 @@ read_existing_secret() {  # <key-name>
     [ -f "$COMPOSE" ] || return 0
     grep -E "^[[:space:]]*$1:" "$COMPOSE" 2>/dev/null | head -1 \
         | sed -E "s/^[[:space:]]*$1:[[:space:]]*\"?([^\"]*)\"?.*$/\1/" || true
+}
+
+# ----------------------------------------------------------------------------
+# Existing git repositories on this host.
+#
+# Repositories the user already has on the server are mounted at the SAME path
+# inside the container as outside ("identity" mounts, e.g. /srv/git:/srv/git).
+# That choice matters: the path shown in Code League, stored in its database and
+# printed in logs is then the real host path, so there is nothing to translate
+# and nothing to get out of step.
+#
+# They are mounted READ-WRITE on purpose. Sync runs `git fetch --all --prune`
+# and writes retention pins with `git update-ref`, both inside .git, so a
+# read-only mount yields a repository that can be analysed exactly once and
+# never refreshed.
+#
+# Only the directories named here are exposed -- never the whole filesystem.
+# ----------------------------------------------------------------------------
+
+# Identity mounts already present in the compose file: "- X:Y" where X == Y.
+# Everything the installer manages itself (data, repos) maps to a different
+# path inside, so this cannot pick those up by mistake.
+read_existing_repo_mounts() {
+    [ -f "$COMPOSE" ] || return 0
+    grep -E "^[[:space:]]*-[[:space:]]*/[^:]+:/[^:]+" "$COMPOSE" 2>/dev/null \
+        | sed -E 's/^[[:space:]]*-[[:space:]]*//; s/:ro$//' \
+        | awk -F: '$1 == $2 { print $1 }' || true
+}
+
+# Fills REPO_PATHS (newline-separated, validated).
+resolve_repo_paths() {
+    REPO_PATHS=""
+    REPO_PATHS_REUSED=0
+    local candidates=""
+
+    if [ -n "${CODELEAGUE_REPO_PATHS:-}" ]; then
+        candidates="$(printf '%s' "$CODELEAGUE_REPO_PATHS" | tr ',' '\n')"
+    else
+        # An update must keep what the previous install had, or a routine
+        # upgrade would silently drop the user's repositories.
+        local existing; existing="$(read_existing_repo_mounts)"
+        if [ -n "$existing" ]; then
+            candidates="$existing"
+            REPO_PATHS_REUSED=1
+            msg "[INFO] Keeping existing repository mounts:"
+            printf '%s\n' "$existing" | while read -r p; do [ -n "$p" ] && msg "         $p"; done
+        elif [ -r /dev/tty ]; then
+            msg ""
+            msg "  Code League clones repositories it imports from GitHub/GitLab/Azure into"
+            msg "  $DIR/repos automatically. You only need this if you ALREADY have git"
+            msg "  repositories on this server that Code League should analyse."
+            local ans; ans="$(prompt '  Existing git repositories on this server? Parent directory (blank for none)' '')"
+            candidates="$(printf '%s' "$ans" | tr ',' '\n')"
+        fi
+    fi
+
+    local p
+    while IFS= read -r p; do
+        p="$(printf '%s' "$p" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+        [ -n "$p" ] || continue
+        case "$p" in
+            /) err "Refusing to mount the whole filesystem (/). Name the directory holding your repositories instead."; continue ;;
+            /*) : ;;
+            *)  err "Skipping '$p': must be an absolute path."; continue ;;
+        esac
+        if [ ! -d "$p" ]; then
+            if [ "${REPO_PATHS_REUSED:-0}" = "1" ]; then
+                # An update that quietly dropped a mount would take the user's
+                # repositories offline with no clue why, so say it plainly.
+                err "WARNING: '$p' was mounted before but no longer exists on this host."
+                err "         It will NOT be mounted, and repositories under it will stop syncing."
+                err "         Restore the directory and re-run, or ignore this if it was intentional."
+            else
+                err "Skipping '$p': not a directory on this host."
+            fi
+            continue
+        fi
+        REPO_PATHS="${REPO_PATHS}${p}"$'\n'
+    done <<EOF
+$candidates
+EOF
+}
+
+# Emits the volume lines for the compose file (empty when none).
+repo_mount_lines() {
+    local p
+    printf '%s' "$REPO_PATHS" | while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        printf '      - %s:%s\n' "$p" "$p"
+    done
 }
 
 resolve_secrets() {
@@ -395,6 +495,7 @@ install() {
     mkdir -p "$DIR/data" "$DIR/repos"
     resolve_secrets
     resolve_machine_id
+    resolve_repo_paths
 
     msg "[INFO] Writing $COMPOSE ..."
     cat > "$COMPOSE" <<EOF
@@ -419,6 +520,7 @@ services:
     volumes:
       - ${DIR}/data:/app/data
       - ${DIR}/repos:/repos
+$(repo_mount_lines)
 EOF
     chmod 600 "$COMPOSE" 2>/dev/null || true   # holds JWT_SECRET / CF_ENC_KEY
 
