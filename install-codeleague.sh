@@ -376,13 +376,19 @@ register_for_license() {
 #
 # A container can't recreate itself, so we install a tiny HOST updater that the
 # app can trigger. The app writes "<DIR>/data/.update-request" (its data volume);
-# a watcher on the host runs codeleague-update.sh, which does
+# a watcher on the host runs <UPDATER_NAME>.sh, which does
 # `docker compose pull && up -d`. We mark availability with
 # "<DIR>/data/.host-update-enabled" so the app shows an in-app "Update now" button
 # (and falls back to the manual command when the marker is absent).
 # ----------------------------------------------------------------------------
+# The base name appears in three places -- the script, the systemd units, and
+# the crontab line remove_host_updater greps for. Defined once so re-prefixing it
+# (which anyone installing several products on one host must do, or the unit
+# names collide) cannot leave one of them behind.
+UPDATER_NAME="${CODELEAGUE_UPDATER_NAME:-codeleague-update}"
+
 install_host_updater() {
-    local update_script="$DIR/codeleague-update.sh"
+    local update_script="$DIR/${UPDATER_NAME}.sh"
 
     # 1) The updater itself (runs on the host, out-of-band from the container).
     cat > "$update_script" <<EOF
@@ -429,25 +435,25 @@ EOF
     #    systemd; otherwise a 1-minute cron poll (works without root).
     local installed=""
     if command -v systemctl >/dev/null 2>&1 && [ "$(id -u)" = "0" ] && [ -d /etc/systemd/system ]; then
-        cat > /etc/systemd/system/codeleague-update.service <<EOF
+        cat > /etc/systemd/system/${UPDATER_NAME}.service <<EOF
 [Unit]
 Description=CodeLeague self-update (pull new image + recreate container)
 [Service]
 Type=oneshot
 ExecStart=$update_script
 EOF
-        cat > /etc/systemd/system/codeleague-update.path <<EOF
+        cat > /etc/systemd/system/${UPDATER_NAME}.path <<EOF
 [Unit]
 Description=Watch for CodeLeague in-app update requests
 [Path]
 PathExists=$DIR/data/.update-request
 PathExists=$DIR/data/.restart-request
-Unit=codeleague-update.service
+Unit=${UPDATER_NAME}.service
 [Install]
 WantedBy=multi-user.target
 EOF
         systemctl daemon-reload >/dev/null 2>&1 || true
-        systemctl enable --now codeleague-update.path >/dev/null 2>&1 && installed="systemd"
+        systemctl enable --now "${UPDATER_NAME}.path" >/dev/null 2>&1 && installed="systemd"
     fi
     if [ -z "$installed" ] && command -v crontab >/dev/null 2>&1; then
         ( crontab -l 2>/dev/null | grep -vF "$update_script"; echo "* * * * * $update_script" ) \
@@ -471,12 +477,12 @@ EOF
 
 remove_host_updater() {
     if command -v systemctl >/dev/null 2>&1 && [ "$(id -u)" = "0" ]; then
-        systemctl disable --now codeleague-update.path >/dev/null 2>&1 || true
-        rm -f /etc/systemd/system/codeleague-update.path /etc/systemd/system/codeleague-update.service
+        systemctl disable --now "${UPDATER_NAME}.path" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/${UPDATER_NAME}.path" "/etc/systemd/system/${UPDATER_NAME}.service"
         systemctl daemon-reload >/dev/null 2>&1 || true
     fi
     if command -v crontab >/dev/null 2>&1; then
-        crontab -l 2>/dev/null | grep -vF "$DIR/codeleague-update.sh" | crontab - 2>/dev/null || true
+        crontab -l 2>/dev/null | grep -vF "$DIR/${UPDATER_NAME}.sh" | crontab - 2>/dev/null || true
     fi
     rm -f "$DIR/data/.host-update-enabled" "$DIR/data/.restart-request" "$DIR/data/.update-request" 2>/dev/null || true
 }
