@@ -35,7 +35,7 @@ set -euo pipefail
 
 # Installer-script version (the container image is versioned separately by its
 # tag). Bump when you change this script; shown by --version.
-INSTALLER_VERSION="1.1.0"
+INSTALLER_VERSION="1.2.0"
 
 IMAGE="${CODELEAGUE_IMAGE:-ghcr.io/speedbitsinfinitytools/codeleague:latest-release}"
 CONTAINER_NAME="${CODELEAGUE_CONTAINER:-codeleague}"
@@ -392,17 +392,35 @@ install_host_updater() {
 set -uo pipefail
 DIR="$DIR"
 REQ="\$DIR/data/.update-request"
+RESTART_REQ="\$DIR/data/.restart-request"
 LOG="\$DIR/update.log"
 LOCK="\$DIR/.update.lock"
 exec 9>"\$LOCK" 2>/dev/null || exit 0
 command -v flock >/dev/null 2>&1 && { flock -n 9 || exit 0; }   # no overlapping runs
-[ -f "\$REQ" ] || exit 0                                        # nothing requested
-rm -f "\$REQ"                                                   # claim the request
+
+# Claim the request BEFORE acting on it: the work below replaces the container
+# that asked, so a request left on disk would be replayed for ever.
+if [ -f "\$REQ" ]; then
+  ACTION=update
+  rm -f "\$REQ" "\$RESTART_REQ"    # an update restarts too; drop a pending restart
+elif [ -f "\$RESTART_REQ" ]; then
+  ACTION=restart
+  rm -f "\$RESTART_REQ"
+else
+  exit 0                            # nothing requested
+fi
+
 {
-  echo "=== \$(date -Iseconds) CodeLeague update start ==="
+  echo "=== \$(date -Iseconds) CodeLeague \$ACTION start ==="
   cd "\$DIR" || exit 1
-  docker compose pull && docker compose up -d && (docker image prune -f || true)
-  echo "=== \$(date -Iseconds) CodeLeague update done ==="
+  if [ "\$ACTION" = update ]; then
+    docker compose pull && docker compose up -d && (docker image prune -f || true)
+  else
+    # Restart ONLY. Never pull here: activating a licence must not quietly move
+    # the install onto a different image.
+    docker compose restart
+  fi
+  echo "=== \$(date -Iseconds) CodeLeague \$ACTION done ==="
 } >>"\$LOG" 2>&1
 EOF
     chmod +x "$update_script"
@@ -423,6 +441,7 @@ EOF
 Description=Watch for CodeLeague in-app update requests
 [Path]
 PathExists=$DIR/data/.update-request
+PathExists=$DIR/data/.restart-request
 Unit=codeleague-update.service
 [Install]
 WantedBy=multi-user.target
@@ -437,7 +456,10 @@ EOF
 
     mkdir -p "$DIR/data"
     if [ -n "$installed" ]; then
-        printf 'installed-by=install-codeleague.sh\nwatcher=%s\nat=%s\n' "$installed" "$(date -Iseconds 2>/dev/null || date)" \
+        # `actions` is a capability list the app reads: without it the app assumes
+        # update-only, so an older install never offers a restart button that
+        # nothing would act on.
+        printf 'installed-by=install-codeleague.sh\nwatcher=%s\nactions=update,restart\nat=%s\n' "$installed" "$(date -Iseconds 2>/dev/null || date)" \
             > "$DIR/data/.host-update-enabled"
         msg "[INFO] Host updater installed ($installed) — the in-app \"Update now\" button is enabled."
     else
@@ -456,7 +478,7 @@ remove_host_updater() {
     if command -v crontab >/dev/null 2>&1; then
         crontab -l 2>/dev/null | grep -vF "$DIR/codeleague-update.sh" | crontab - 2>/dev/null || true
     fi
-    rm -f "$DIR/data/.host-update-enabled" 2>/dev/null || true
+    rm -f "$DIR/data/.host-update-enabled" "$DIR/data/.restart-request" "$DIR/data/.update-request" 2>/dev/null || true
 }
 
 show_status() {
