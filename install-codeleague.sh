@@ -21,6 +21,14 @@ set -euo pipefail
 #   CODELEAGUE_PORT=8080          # host port (default 3000)
 #   CODELEAGUE_DIR=/opt/codeleague# install directory (default: ./codeleague)
 #   CODELEAGUE_IMAGE=...          # override image tag
+#   CODELEAGUE_HOST_MOUNT=/home   # Expose that directory READ-ONLY at /HOST inside the
+#                                 # container, so the in-app file browser can reach files
+#                                 # that live on this server -- picking a migration bundle
+#                                 # to import, for instance. Off unless set. Use "none" to
+#                                 # turn it off on an update. NOT for repositories: sync
+#                                 # writes inside .git, so a repo under a read-only mount
+#                                 # can be analysed once and never refreshed -- use
+#                                 # CODELEAGUE_REPO_PATHS for those.
 #   CODELEAGUE_REPO_PATHS=/srv/git,/mnt/code
 #                                 # Existing git repositories ALREADY on this host that
 #                                 # Code League should analyse. Each is mounted at the
@@ -35,7 +43,7 @@ set -euo pipefail
 
 # Installer-script version (the container image is versioned separately by its
 # tag). Bump when you change this script; shown by --version.
-INSTALLER_VERSION="1.2.0"
+INSTALLER_VERSION="1.3.0"
 
 IMAGE="${CODELEAGUE_IMAGE:-ghcr.io/speedbitsinfinitytools/codeleague:latest-release}"
 CONTAINER_NAME="${CODELEAGUE_CONTAINER:-codeleague}"
@@ -108,6 +116,75 @@ read_existing_secret() {  # <key-name>
     [ -f "$COMPOSE" ] || return 0
     grep -E "^[[:space:]]*$1:" "$COMPOSE" 2>/dev/null | head -1 \
         | sed -E "s/^[[:space:]]*$1:[[:space:]]*\"?([^\"]*)\"?.*$/\1/" || true
+}
+
+# ----------------------------------------------------------------------------
+# Read-only view of the host filesystem, mounted at /HOST.
+#
+# Purely so the in-app file browser can reach a file that lives on the server --
+# importing a migration bundle is the case that needs it. READ-ONLY on purpose:
+# nothing in Code League needs to write there, and :ro means a bug or a hostile
+# repository cannot.
+#
+# This is NOT the way to bring in repositories you already have. Sync writes
+# inside .git (git fetch, and the retention pins), so a repository under a
+# read-only mount can be analysed exactly once and never refreshed -- use
+# CODELEAGUE_REPO_PATHS for those, which mounts them read-write at their own path.
+#
+# Off unless asked for. Mounting / exposes every readable file on the host to the
+# container, /root/.ssh and this compose file's own secrets included, so the
+# prompt says so and a narrower subtree is usually the better answer.
+# ----------------------------------------------------------------------------
+read_existing_host_mount() {
+    [ -f "$COMPOSE" ] || return 0
+    grep -E "^[[:space:]]*-[[:space:]]*[^:]+:/HOST:ro[[:space:]]*$" "$COMPOSE" 2>/dev/null \
+        | sed -E 's/^[[:space:]]*-[[:space:]]*//; s/:\/HOST:ro[[:space:]]*$//' | head -1 || true
+}
+
+# Fills HOST_MOUNT (a host path, or empty for none).
+resolve_host_mount() {
+    HOST_MOUNT=""
+    local candidate=""
+
+    if [ -n "${CODELEAGUE_HOST_MOUNT:-}" ]; then
+        candidate="$CODELEAGUE_HOST_MOUNT"
+        case "$candidate" in
+            none|off|no) return 0 ;;
+        esac
+    else
+        # An update keeps whatever the previous install had, so an upgrade cannot
+        # silently take the browser's view of the host away.
+        local existing; existing="$(read_existing_host_mount)"
+        if [ -n "$existing" ]; then
+            candidate="$existing"
+            msg "[INFO] Keeping existing read-only host mount: $existing"
+        elif [ -r /dev/tty ]; then
+            msg ""
+            msg "  Code League can show a read-only view of this server's filesystem in its"
+            msg "  file browser, so you can pick a file that lives here -- a migration bundle,"
+            msg "  for instance. It is mounted read-only; Code League cannot write to it."
+            msg "  Naming a directory rather than / keeps everything else out of view."
+            local ans; ans="$(prompt '  Expose a directory read-only at /HOST? (blank for none)' '')"
+            candidate="$ans"
+        fi
+    fi
+
+    candidate="$(printf '%s' "$candidate" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    [ -n "$candidate" ] || return 0
+    case "$candidate" in
+        /*) : ;;
+        *)  err "Ignoring host mount '$candidate': must be an absolute path."; return 0 ;;
+    esac
+    if [ ! -d "$candidate" ]; then
+        err "Ignoring host mount '$candidate': not a directory on this host."
+        return 0
+    fi
+    HOST_MOUNT="$candidate"
+}
+
+host_mount_line() {
+    [ -n "${HOST_MOUNT:-}" ] || return 0
+    printf '      - %s:/HOST:ro\n' "$HOST_MOUNT"
 }
 
 # ----------------------------------------------------------------------------
@@ -524,6 +601,7 @@ install() {
     resolve_secrets
     resolve_machine_id
     resolve_repo_paths
+    resolve_host_mount
 
     msg "[INFO] Writing $COMPOSE ..."
     cat > "$COMPOSE" <<EOF
@@ -549,6 +627,7 @@ services:
       - ${DIR}/data:/app/data
       - ${DIR}/repos:/repos
 $(repo_mount_lines)
+$(host_mount_line)
 EOF
     chmod 600 "$COMPOSE" 2>/dev/null || true   # holds JWT_SECRET / CF_ENC_KEY
 
